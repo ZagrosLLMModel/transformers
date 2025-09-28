@@ -31,7 +31,6 @@ class ZagrosConfig(PretrainedConfig):
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
 
-
     Args:
         vocab_size (`int`, *optional*, defaults to 151936):
             Vocabulary size of the Zagros model. Defines the number of different tokens that can be represented by the
@@ -132,18 +131,21 @@ class ZagrosConfig(PretrainedConfig):
             The list contains layer index, from 0 to num_layers-1 if we have num_layers layers
             If `mlp_only_layers` is empty, `decoder_sparse_step` is used to determine the sparsity.
 
+    Example:
+
     ```python
     >>> from transformers import ZagrosModel, ZagrosConfig
 
     >>> # Initializing a Zagros style configuration
     >>> configuration = ZagrosConfig()
 
-    >>> # Initializing a model from the Qwen3-15B-A2B" style configuration
+    >>> # Initializing a model from the Qwen3-15B-A2B style configuration
     >>> model = ZagrosModel(configuration)
 
     >>> # Accessing the model configuration
     >>> configuration = model.config
-    ```"""
+    ```
+    """
 
     model_type = "zagros"
     keys_to_ignore_at_inference = ["past_key_values"]
@@ -235,6 +237,5 @@ class ZagrosConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
-
 
 __all__ = ["ZagrosConfig"]

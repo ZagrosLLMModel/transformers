@@ -216,52 +216,56 @@ class ZagrosSparseMoeBlock(nn.Module):
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
+        self.use_dual_routing = config.use_dual_routing  # NEW
+        self.diversity_factor = config.diversity_factor  # NEW
+        self.super_threshold = config.super_expert_threshold  # NEW
 
-        # gating
-        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        # Dual routing gates (from ICML 2025)
+        self.primary_gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        if self.use_dual_routing:
+            self.secondary_gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+
         self.experts = nn.ModuleList(
             [ZagrosMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """ """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        # router_logits: (batch * sequence_length, n_experts)
-        router_logits = self.gate(hidden_states)
+        # Primary router
+        primary_logits = self.primary_gate(hidden_states)
+        routing_weights = F.softmax(primary_logits, dim=1, dtype=torch.float)
+        if self.use_dual_routing:
+            secondary_logits = self.secondary_gate(hidden_states)
+            routing_weights = (routing_weights + F.softmax(secondary_logits, dim=1, dtype=torch.float)) / 2  # Average for stability
 
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        if self.norm_topk_prob:  # only diff with mixtral sparse moe block!
+        if self.norm_topk_prob:
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
+
+        # NEW: Diversity factor (from Interpretable MoE Jun 2025) - variance for expert spread
+        diversity_loss = self.diversity_factor * torch.mean(torch.var(routing_weights, dim=1))
 
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
         )
 
-        # One hot encode the selected experts to create an expert mask
-        # this will be used to easily index which expert is going to be sollicitated
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        # NEW: Super experts preservation (from arXiv Jul 2025) - mask low-activation experts
+        expert_activations = torch.mean(routing_weights, dim=0)
+        super_mask = expert_activations > self.super_threshold
+        selected_experts = selected_experts * super_mask.unsqueeze(0).int()  # Mask non-super
 
-        # Loop over all available experts in the model and perform the computation on each expert
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
         for expert_idx in expert_hit:
             expert_layer = self.experts[expert_idx]
             idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
-
-            # Index the correct hidden states and compute the expert hidden state for
-            # the current expert. We need to make sure to multiply the output hidden
-            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
             current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
             current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
-
-            # However `index_add_` only support torch tensors for indexing so we'll use
-            # the `top_x` tensor here.
             final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-        return final_hidden_states, router_logits
+        return final_hidden_states, primary_logits, diversity_loss  # NEW: Return diversity_loss
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -289,16 +293,13 @@ class ZagrosDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: ZagrosConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-
         self.self_attn = ZagrosAttention(config, layer_idx)
-
         if (layer_idx not in config.mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             self.mlp = ZagrosSparseMoeBlock(config)
         else:
             self.mlp = ZagrosMLP(config, intermediate_size=config.intermediate_size)
-
         self.input_layernorm = ZagrosRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = ZagrosRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -313,35 +314,8 @@ class ZagrosDecoderLayer(GradientCheckpointingLayer):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.FloatTensor:
-        """
-        Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`, *optional*): attention mask of size
-                `(batch, sequence_length)` where padding elements are indicated by 0.
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
-            output_router_logits (`bool`, *optional*):
-                Whether or not to return the logits of all the routers. They are useful for computing the router loss,
-                and should not be returned during inference.
-            use_cache (`bool`, *optional*):
-                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
-                (see `past_key_values`).
-            past_key_values (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence.
-            position_embeddings (`tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*):
-                Tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
-                with `head_dim` being the embedding dimension of each attention head.
-            kwargs (`dict`, *optional*):
-                Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
-                into the model
-        """
         residual = hidden_states
-
         hidden_states = self.input_layernorm(hidden_states)
-
-        # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
@@ -352,17 +326,17 @@ class ZagrosDecoderLayer(GradientCheckpointingLayer):
             **kwargs,
         )
         hidden_states = residual + hidden_states
-
-        # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        # For the MoE layers, we need to unpack
-        if isinstance(hidden_states, tuple):
-            hidden_states, _ = hidden_states
+        moe_out = self.mlp(hidden_states)
+        if isinstance(moe_out, tuple) and len(moe_out) == 3:
+            hidden_states, router_logits, diversity_loss = moe_out  # NEW: Unpack diversity
+        else:
+            hidden_states = moe_out
+            router_logits = None
+            diversity_loss = torch.tensor(0.0, device=hidden_states.device)
         hidden_states = residual + hidden_states
-
-        return hidden_states
+        return hidden_states, router_logits, diversity_loss  # NEW: Return diversity_loss
 
 
 class ZagrosRotaryEmbedding(nn.Module):
@@ -420,13 +394,12 @@ class ZagrosPreTrainedModel(PreTrainedModel):
     }
 
 
-@auto_docstring
+#@auto_docstring
 class ZagrosModel(ZagrosPreTrainedModel):
     def __init__(self, config: ZagrosConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
             [ZagrosDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
@@ -434,8 +407,6 @@ class ZagrosModel(ZagrosPreTrainedModel):
         self.norm = ZagrosRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = ZagrosRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
-
-        # Initialize weights and apply final processing
         self.post_init()
 
     @check_model_inputs
@@ -453,13 +424,10 @@ class ZagrosModel(ZagrosPreTrainedModel):
     ) -> MoeModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
-
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
@@ -467,7 +435,6 @@ class ZagrosModel(ZagrosPreTrainedModel):
             )
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
-
         mask_function = create_causal_mask if self.config.sliding_window is None else create_sliding_window_causal_mask
         causal_mask = mask_function(
             config=self.config,
@@ -477,14 +444,12 @@ class ZagrosModel(ZagrosPreTrainedModel):
             past_key_values=past_key_values,
             position_ids=position_ids,
         )
-
         hidden_states = inputs_embeds
-
-        # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            hidden_states = decoder_layer(
+        all_router_logits = []
+        total_diversity_loss = torch.tensor(0.0, device=hidden_states.device)  # NEW
+        for decoder_layer in self.layers:
+            layer_out = decoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
                 attention_mask=causal_mask,
@@ -494,14 +459,21 @@ class ZagrosModel(ZagrosPreTrainedModel):
                 cache_position=cache_position,
                 **kwargs,
             )
-
+            if isinstance(layer_out, tuple) and len(layer_out) == 3:
+                hidden_states, router_logit, div_loss = layer_out
+                if router_logit is not None:
+                    all_router_logits.append(router_logit)
+                total_diversity_loss += div_loss  # NEW: Aggregate
+            else:
+                hidden_states = layer_out
         hidden_states = self.norm(hidden_states)
-
-        return MoeModelOutputWithPast(  # only diff with Mistral is the output type, we need MoE
+        outputs = MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
+            router_logits=tuple(all_router_logits) if all_router_logits else None,
         )
-
+        outputs.diversity_loss = total_diversity_loss / len(self.layers)  # NEW: Average diversity_loss
+        return outputs
 
 def load_balancing_loss_func(
     gate_logits: Union[torch.Tensor, tuple[torch.Tensor], None],
@@ -585,7 +557,7 @@ def load_balancing_loss_func(
     return overall_loss * num_experts
 
 
-@auto_docstring
+#@auto_docstring
 class ZagrosForCausalLM(ZagrosPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
@@ -599,8 +571,6 @@ class ZagrosForCausalLM(ZagrosPreTrainedModel, GenerationMixin):
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
-
-        # Initialize weights and apply final processing
         self.post_init()
 
     @can_return_tuple
@@ -619,34 +589,9 @@ class ZagrosForCausalLM(ZagrosPreTrainedModel, GenerationMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> MoeCausalLMOutputWithPast:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
-
-        Example:
-
-        ```python
-        >>> from transformers import AutoTokenizer, ZagrosForCausalLM
-
-        >>> model = ZagrosForCausalLM.from_pretrained("Qwen/Qwen3-MoE-15B-A2B")
-        >>> tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-MoE-15B-A2B")
-
-        >>> prompt = "Hey, are you conscious? Can you talk to me?"
-        >>> inputs = tokenizer(prompt, return_tensors="pt")
-
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
-        ```"""
-
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
         )
-
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs: MoeModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -654,20 +599,15 @@ class ZagrosForCausalLM(ZagrosPreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            output_router_logits=output_router_logits,
             cache_position=cache_position,
             **kwargs,
         )
-
         hidden_states = outputs.last_hidden_state
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-
         loss = None
         if labels is not None:
             loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
-
         aux_loss = None
         if output_router_logits:
             aux_loss = load_balancing_loss_func(
@@ -677,8 +617,9 @@ class ZagrosForCausalLM(ZagrosPreTrainedModel, GenerationMixin):
                 attention_mask,
             )
             if labels is not None:
-                loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
-
+                loss += self.router_aux_loss_coef * aux_loss.to(loss.device)
+                if hasattr(outputs, 'diversity_loss'):  # NEW: Add diversity to loss
+                    loss += outputs.diversity_loss
         return MoeCausalLMOutputWithPast(
             loss=loss,
             aux_loss=aux_loss,

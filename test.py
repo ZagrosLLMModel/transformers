@@ -7,7 +7,7 @@ sys.path.insert(0, transformers_path)
 from src.transformers.models.zagros.configuration_zagros import ZagrosConfig
 from src.transformers.models.zagros.modeling_zagros import ZagrosForCausalLM
 
-# config_dict کامل با تمام params جدید (سازگار با تغییرات)
+# config_dict کامل با paramهای جدید (noise_std اضافه شده)
 config_dict = {
     "architectures": ["ZagrosForCausalLM"],
     "attention_bias": False,
@@ -21,14 +21,14 @@ config_dict = {
     "intermediate_size": 6144,
     "max_position_embeddings": 262144,
     "max_window_layers": 48,
-    "mlp_only_layers": [i for i in range(0, 48, 4)],  # Hybrid
+    "mlp_only_layers": [i for i in range(0, 48, 4)],
     "model_type": "zagros",
     "moe_intermediate_size": 384,
     "norm_topk_prob": True,
     "num_attention_heads": 32,
     "num_experts": 512,
     "num_experts_per_tok": 8,
-    "num_hidden_layers": 4,  # کوچک برای تست روی RTX 4050
+    "num_hidden_layers": 4,  # برای تست کوچک
     "num_key_value_heads": 4,
     "output_router_logits": False,
     "pad_token_id": 151654,
@@ -44,9 +44,10 @@ config_dict = {
     "use_cache": True,
     "use_sliding_window": False,
     "vocab_size": 151936,
-    "use_dual_routing": True,  # NEW
-    "diversity_factor": 0.5,  # NEW
-    "super_expert_threshold": 0.005  # NEW
+    "use_dual_routing": True,
+    "diversity_factor": 0.5,
+    "super_expert_threshold": 0.005,
+    "noise_std": 0.01  # NEW
 }
 
 config = ZagrosConfig(**config_dict)

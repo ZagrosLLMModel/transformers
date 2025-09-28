@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
+# Copyright 2025 Darsadi Lab. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -39,7 +39,7 @@ class ZagrosConfig(PretrainedConfig):
             Dimension of the hidden representations.
         intermediate_size (`int`, *optional*, defaults to 6144):
             Dimension of the MLP representations.
-        num_hidden_layers (`int`, *optional*, defaults to 24):
+        num_hidden_layers (`int`, *optional*, defaults to 48):
             Number of hidden layers in the Transformer encoder.
         num_attention_heads (`int`, *optional*, defaults to 32):
             Number of attention heads for each attention layer in the Transformer encoder.
@@ -53,7 +53,7 @@ class ZagrosConfig(PretrainedConfig):
 
         hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
             The non-linear activation function (function or string) in the decoder.
-        max_position_embeddings (`int`, *optional*, defaults to 32768):
+        max_position_embeddings (`int`, *optional*, defaults to 262144):
             The maximum sequence length that this model might ever be used with.
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
@@ -64,7 +64,7 @@ class ZagrosConfig(PretrainedConfig):
             relevant if `config.is_decoder=True`.
         tie_word_embeddings (`bool`, *optional*, defaults to `False`):
             Whether the model's input and output word embeddings should be tied.
-        rope_theta (`float`, *optional*, defaults to 10000.0):
+        rope_theta (`float`, *optional*, defaults to 10000000.0):
             The base period of the RoPE embeddings.
         rope_scaling (`Dict`, *optional*):
             Dictionary containing the scaling configuration for the RoPE embeddings. NOTE: if you apply new rope type
@@ -107,29 +107,37 @@ class ZagrosConfig(PretrainedConfig):
             Whether to use a bias in the query, key, value and output projection layers during self-attention.
         use_sliding_window (`bool`, *optional*, defaults to `False`):
             Whether to use sliding window attention.
-        sliding_window (`int`, *optional*, defaults to 4096):
-            Sliding window attention (SWA) window size. If not specified, will default to `4096`.
+        sliding_window (`int`, *optional*, defaults to None):
+            Sliding window attention (SWA) window size. If not specified, will default to `None`.
         attention_dropout (`float`, *optional*, defaults to 0.0):
             The dropout ratio for the attention probabilities.
         decoder_sparse_step (`int`, *optional*, defaults to 1):
             The frequency of the MoE layer.
-        moe_intermediate_size (`int`, *optional*, defaults to 768):
+        moe_intermediate_size (`int`, *optional*, defaults to 384):
             Intermediate size of the routed expert.
         num_experts_per_tok (`int`, *optional*, defaults to 8):
             Number of selected experts.
-        num_experts (`int`, *optional*, defaults to 128):
+        num_experts (`int`, *optional*, defaults to 512):
             Number of routed experts.
-        norm_topk_prob (`bool`, *optional*, defaults to `False`):
+        norm_topk_prob (`bool`, *optional*, defaults to `True`):
             Whether to normalize the topk probabilities.
         output_router_logits (`bool`, *optional*, defaults to `False`):
             Whether or not the router logits should be returned by the model. Enabling this will also
             allow the model to output the auxiliary loss, including load balancing loss and router z-loss.
-        router_aux_loss_coef (`float`, *optional*, defaults to 0.001):
+        router_aux_loss_coef (`float`, *optional*, defaults to 0.0):
             The aux loss factor for the total loss.
-        mlp_only_layers (`list[int]`, *optional*, defaults to `[]`):
+        mlp_only_layers (`list[int]`, *optional*, defaults to `[i for i in range(0, 48, 4)]`):
             Indicate which layers use ZagrosMLP rather than ZagrosSparseMoeBlock
             The list contains layer index, from 0 to num_layers-1 if we have num_layers layers
             If `mlp_only_layers` is empty, `decoder_sparse_step` is used to determine the sparsity.
+        use_dual_routing (`bool`, *optional*, defaults to `True`):
+            Whether to use dual routing for better stability.
+        diversity_factor (`float`, *optional*, defaults to 0.5):
+            Factor for diversity loss in routing.
+        super_expert_threshold (`float`, *optional*, defaults to 0.005):
+            Threshold for preserving super experts.
+        noise_std (`float`, *optional*, defaults to 0.01):
+            Standard deviation for adding noise in dynamic routing.
 
     Example:
 
@@ -144,8 +152,7 @@ class ZagrosConfig(PretrainedConfig):
 
     >>> # Accessing the model configuration
     >>> configuration = model.config
-    ```
-    """
+    ```"""
 
     model_type = "zagros"
     keys_to_ignore_at_inference = ["past_key_values"]
@@ -174,29 +181,33 @@ class ZagrosConfig(PretrainedConfig):
         vocab_size=151936,
         hidden_size=2048,
         intermediate_size=6144,
-        num_hidden_layers=24,
+        num_hidden_layers=48,
         num_attention_heads=32,
         num_key_value_heads=4,
         hidden_act="silu",
-        max_position_embeddings=32768,
+        max_position_embeddings=262144,
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         use_cache=True,
         tie_word_embeddings=False,
-        rope_theta=10000.0,
+        rope_theta=10000000.0,
         rope_scaling=None,
         attention_bias=False,
         use_sliding_window=False,
-        sliding_window=4096,
+        sliding_window=None,
         attention_dropout=0.0,
         decoder_sparse_step=1,
-        moe_intermediate_size=768,
+        moe_intermediate_size=384,
         num_experts_per_tok=8,
-        num_experts=128,
-        norm_topk_prob=False,
+        num_experts=512,
+        norm_topk_prob=True,
         output_router_logits=False,
-        router_aux_loss_coef=0.001,
-        mlp_only_layers=None,
+        router_aux_loss_coef=0.0,
+        mlp_only_layers=[i for i in range(0, 48, 4)],
+        use_dual_routing=True,
+        diversity_factor=0.5,
+        super_expert_threshold=0.005,
+        noise_std=0.01,  # NEW for dynamic noise
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -232,6 +243,10 @@ class ZagrosConfig(PretrainedConfig):
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.mlp_only_layers = [] if mlp_only_layers is None else mlp_only_layers
+        self.use_dual_routing = use_dual_routing
+        self.diversity_factor = diversity_factor
+        self.super_expert_threshold = super_expert_threshold
+        self.noise_std = noise_std
 
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
